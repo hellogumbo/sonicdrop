@@ -35,8 +35,8 @@ The main limitations are elsewhere:
 
 - **The band is fixed.** Consumer speaker and microphone response near Nyquist is highly irregular. A good lane on one device pair can be a notch on another.
 - **The band is high for commodity hardware.** Jeon, Kim, and Lee report that COTS microphones and speakers become severely frequency-selective above 21 kHz. BatNet likewise found response to vary by both frequency and device.
-- **There is no channel estimate or equalizer.** Reflections, device response, sample-clock offset, and movement all alter the received waveform. The current detector tolerates a frequency offset, but it does not undo intersymbol interference.
-- **Errors are bursty, not independent.** A hand movement or a multipath null can damage several adjacent symbols or a complete frame. Per-byte Hamming coding is poorly matched to that failure mode.
+- **The channel estimate is deliberately narrow.** Version 3 uses the balanced sync field to estimate per-carrier gain and noise, with an independent raw-decision fallback when that estimate becomes stale before the body. It still does not track a changing channel or undo intersymbol interference. Reflections, sample-clock offset, and movement still alter the received waveform.
+- **Errors are bursty, not independent.** Version 3 transmits Hamming bits column-major so short bursts are distributed across codewords, but a hand movement or multipath null can still damage a complete frame.
 - **A single missing frame prevents completion.** At 4 KB, many minutes and dozens of frames must all arrive. Range and file size therefore compound the loss probability.
 - **A reported 48 kHz stream is not proof of ultrasonic bandwidth.** It verifies the rate exposed by the browser, not the response of the DAC, amplifier, speaker, microphone, analog filter, OS processing, or resampler.
 
@@ -61,7 +61,7 @@ Rates below are the authors’ reported endpoints under their own hardware and t
 
 | System | Frequency band | Modulation/protocol | Reported rate | Reported distance | What SonicDrop should learn |
 | --- | --- | --- | ---: | ---: | --- |
-| **SonicDrop v2 current** | 20.80–21.76 kHz | Gray-mapped 4-CPFSK; Hamming(12,8); CRC-32 | ~76.9 bit/s max frame-fragment rate | Not physically characterized | Establish a real device/distance baseline before changing the waveform. |
+| **SonicDrop v3 current** | 20.80–21.76 kHz | Gray-mapped 4-CPFSK; bit-interleaved Hamming(12,8); soft decisions; CRC-32 | ~76.9 bit/s max frame-fragment rate | Not physically characterized | Establish a real device/distance baseline before changing the waveform. |
 | [Google Nearby ultrasound](https://doi.org/10.1109/TMM.2017.2766049) | 18.5–20 kHz | Direct-sequence spread spectrum, a 127-chip pseudorandom code, and orthogonal MFSK symbols | 94.5 raw bit/s | Reliable at 2 m; often worked at 10 m | Correlation/spreading can trade spectral efficiency for resilience to multipath, motion, weak signal, and narrowband noise. The band is not guaranteed inaudible. |
 | [High Data Rate NUSC](https://eurasip.org/Proceedings/Eusipco/Eusipco2021/pdfs/0001681.pdf) | 18–20 kHz, centered at 19 kHz | 2 ksymbol/s QPSK with phase-coherent adaptive decision-feedback equalization | 4 kbit/s | Up to 5 m between consumer laptops | Equalization and phase/timing tracking can recover orders of magnitude more throughput from the same narrow channel. The paper used 30% of symbols for training. The band conflicts with a strict inaudibility requirement. |
 | [HRCSS](https://doi.org/10.1109/TMC.2021.3051665) | 18–22 kHz | Multiple loosely orthogonal chirp carriers, channel probing, and rate adaptation | 500 bit/s at 10 m; 125 bit/s at 20 m | 10 m and 20 m endpoints | A probe/feedback handshake and adaptive chirp bandwidth can choose range over rate as conditions worsen. Its full band includes potentially audible frequencies. |
@@ -127,9 +127,9 @@ This is the highest-priority throughput experiment because the EUSIPCO system di
 
 Single-carrier QPSK with a DFE is likely the cleaner first browser implementation. OFDM becomes attractive once channel estimation, clock-offset correction, and adaptive bit loading are stable.
 
-### Phase 3: interleaving and stronger FEC
+### Phase 3: stronger FEC beyond the v3 interleaver
 
-- Interleave coded bits across time and, for multicarrier modes, across frequency so a short fade or notch is distributed across several codewords.
+- Keep the v3 coded-bit interleaver across time and extend the same principle across frequency for future multicarrier modes.
 - Replace per-byte Hamming with a code that can use soft decisions and correct bursts: a convolutional code, LDPC, or a practical short-block alternative selected by measured packet-error curves.
 - Keep a CRC on independently retransmittable blocks and SHA-256 for final accidental-corruption detection.
 - Make code rate adaptive. More parity is useful at distance; it is wasted airtime on a clean proximity link.

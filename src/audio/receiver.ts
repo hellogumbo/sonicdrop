@@ -2,6 +2,7 @@ import {
   AUDIO_SAMPLE_RATE,
   FRAME_SAMPLES,
   assembleTransfer,
+  measureUltrasonicLevel,
   type AssembledTransfer,
   type DecodedFrame,
   type DecodedPcmFrame,
@@ -32,13 +33,8 @@ class SonicDropCaptureProcessor extends AudioWorkletProcessor {
       sourceOffset += writable;
 
       if (this.offset === this.buffer.length) {
-        let sum = 0;
-        for (let index = 0; index < this.buffer.length; index += 1) {
-          sum += this.buffer[index] * this.buffer[index];
-        }
-        const rms = Math.sqrt(sum / this.buffer.length);
         const samples = this.buffer;
-        this.port.postMessage({ samples, rms }, [samples.buffer]);
+        this.port.postMessage(samples, [samples.buffer]);
         this.buffer = new Float32Array(${CAPTURE_CHUNK_SAMPLES});
         this.offset = 0;
       }
@@ -74,11 +70,6 @@ interface ReceiverOptions {
   onComplete?: (transfer: ReceivedTransfer) => void
   onError?: (error: Error) => void
   onFatalError?: (error: Error) => void
-}
-
-interface CaptureMessage {
-  samples: Float32Array
-  rms: number
 }
 
 export class UltrasonicReceiver {
@@ -190,7 +181,7 @@ export class UltrasonicReceiver {
       this.silentOutput = this.context.createGain()
       this.silentOutput.gain.value = 0
 
-      this.worklet.port.onmessage = (event: MessageEvent<CaptureMessage>) => {
+      this.worklet.port.onmessage = (event: MessageEvent<Float32Array>) => {
         this.handleCapture(event.data)
       }
 
@@ -235,10 +226,10 @@ export class UltrasonicReceiver {
     this.stream = null
   }
 
-  private handleCapture({ samples, rms }: CaptureMessage): void {
+  private handleCapture(samples: Float32Array): void {
     if (this.stopped) return
 
-    this.signalLevel = Math.min(1, rms * 20)
+    this.signalLevel = Math.min(1, measureUltrasonicLevel(samples) * 20)
     this.appendSamples(samples)
 
     const now = performance.now()

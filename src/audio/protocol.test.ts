@@ -3,11 +3,15 @@ import {
   AUDIO_SAMPLE_RATE,
   FRAME_BYTES,
   FRAME_SAMPLES,
+  LEADER_SYMBOL_COUNT,
   MAX_MESSAGE_BYTES,
   MAX_PAYLOAD_BYTES,
   MAX_TRANSFER_FRAMES,
   PEAK_AMPLITUDE,
+  PREAMBLE_SYMBOL_COUNT,
   ProtocolError,
+  SYMBOL_SAMPLES,
+  SYNC_SYMBOLS,
   TONE_FREQUENCIES,
   TRANSFER_FLAG_MESSAGE,
   assembleTransfer,
@@ -17,9 +21,11 @@ import {
   createRawFrame,
   crc32,
   decodeFrameFromPcm,
+  encodeFrameBodySymbols,
   estimateFrameCount,
   hammingDecodeWord,
   hammingEncodeByte,
+  measureUltrasonicLevel,
   modulateFrame,
   parseRawFrame,
 } from './protocol'
@@ -160,6 +166,33 @@ describe('SonicDrop protocol framing', () => {
 })
 
 describe('Hamming(12,8)', () => {
+  it('pins the v3 interleaved body mapping to a golden vector', () => {
+    const rawFrame = Uint8Array.from(
+      '5344032012345678000200073f0b30557a9fc4e90e33587da2c7ec11365b80a5caef14395e83a8cdf2173c6186abd0f51a3f6489aed3f81d42678cb1d6fb20456a8fb4d9fe23486d92b7dc01d226ada9'
+        .match(/.{2}/g)!
+        .map((byte) => Number.parseInt(byte, 16)),
+    )
+    const symbols = encodeFrameBodySymbols(rawFrame)
+
+    expect(symbols).toHaveLength(480)
+    expect(crc32(symbols)).toBe(0xccd5_5798)
+    expect([
+      ...symbols.slice(0, 12),
+      ...symbols.slice(36, 44),
+      ...symbols.slice(116, 124),
+      ...symbols.slice(236, 244),
+      ...symbols.slice(356, 364),
+      ...symbols.slice(472, 480),
+    ]).toEqual([
+      2, 3, 1, 2, 1, 1, 3, 3, 0, 1, 0, 2,
+      2, 0, 1, 0, 1, 2, 1, 3,
+      2, 3, 3, 2, 2, 2, 3, 1,
+      1, 0, 1, 2, 3, 0, 2, 2,
+      0, 3, 0, 2, 1, 0, 1, 3,
+      1, 1, 1, 1, 1, 1, 0, 2,
+    ])
+  })
+
   it('round-trips every possible byte', () => {
     for (let byte = 0; byte <= 0xff; byte += 1) {
       const decoded = hammingDecodeWord(hammingEncodeByte(byte))
@@ -186,6 +219,49 @@ describe('strict ultrasonic PCM', () => {
     expect(Math.min(...TONE_FREQUENCIES)).toBeGreaterThan(20_000)
     expect(Math.max(...TONE_FREQUENCIES)).toBeLessThan(AUDIO_SAMPLE_RATE / 2)
     expect(PEAK_AMPLITUDE).toBeLessThanOrEqual(0.12)
+  })
+
+  it('measures frequency-shifted carrier energy without reacting to loud audible audio', () => {
+    const audibleOnly = new Float32Array(2_048)
+
+    for (let index = 0; index < audibleOnly.length; index += 1) {
+      audibleOnly[index] = 0.45 * Math.sin(
+        2 * Math.PI * 1_100 * index / AUDIO_SAMPLE_RATE,
+      )
+    }
+
+    expect(measureUltrasonicLevel(audibleOnly)).toBeLessThan(0.0001)
+    for (const offsetHz of [-100, 0, 100]) {
+      const withCarrier = Float32Array.from(audibleOnly, (audible, index) => (
+        audible + 0.025 * Math.sin(
+          2 * Math.PI * (TONE_FREQUENCIES[2] + offsetHz) * index / AUDIO_SAMPLE_RATE,
+        )
+      ))
+      expect(measureUltrasonicLevel(withCarrier)).toBeGreaterThan(0.02)
+    }
+  })
+
+  it('returns finite zero for degenerate level windows and refreshes its window cache', () => {
+    for (const samples of [
+      new Float32Array(),
+      Float32Array.of(1),
+      Float32Array.of(1, -1),
+    ]) {
+      const level = measureUltrasonicLevel(samples)
+      expect(Number.isFinite(level)).toBe(true)
+      expect(level).toBe(0)
+    }
+
+    const carrier = (length: number) => Float32Array.from(
+      { length },
+      (_, index) => 0.025 * Math.sin(
+        2 * Math.PI * TONE_FREQUENCIES[1] * index / AUDIO_SAMPLE_RATE,
+      ),
+    )
+    const firstLength = carrier(1_024)
+    expect(measureUltrasonicLevel(firstLength)).toBeGreaterThan(0.02)
+    expect(measureUltrasonicLevel(carrier(1_537))).toBeGreaterThan(0.02)
+    expect(measureUltrasonicLevel(firstLength)).toBeGreaterThan(0.02)
   })
 
   it('finds and decodes exact PCM after an arbitrary leading offset', async () => {
@@ -220,6 +296,127 @@ describe('strict ultrasonic PCM', () => {
 
     const decoded = decodeFrameFromPcm(pcm)
     expect(decoded?.frame.raw).toEqual(transfer.frames[0])
+  }, 20_000)
+
+  it('calibrates carrier-specific attenuation below the channel-gain floor', async () => {
+    const transfer = await buildTransfer(
+      'notched',
+      '',
+      Uint8Array.from({ length: 37 }, (_, index) => (index * 31 + 5) & 0xff),
+    )
+    const framePcm = modulateFrame(transfer.frames[0])
+    const bodySymbols = encodeFrameBodySymbols(transfer.frames[0])
+    const transmittedSymbols = new Uint8Array(PREAMBLE_SYMBOL_COUNT + bodySymbols.length)
+    transmittedSymbols.fill(0, 0, LEADER_SYMBOL_COUNT)
+    transmittedSymbols.set(SYNC_SYMBOLS, LEADER_SYMBOL_COUNT)
+    transmittedSymbols.set(bodySymbols, PREAMBLE_SYMBOL_COUNT)
+    const amplitudeGains = [0.8, 0.52, 0.12, 1] as const
+
+    for (let symbolIndex = 0; symbolIndex < transmittedSymbols.length; symbolIndex += 1) {
+      const gain = amplitudeGains[transmittedSymbols[symbolIndex]]
+      const symbolStart = symbolIndex * SYMBOL_SAMPLES
+      for (let sample = 0; sample < SYMBOL_SAMPLES; sample += 1) {
+        framePcm[symbolStart + sample] *= gain
+      }
+    }
+
+    expect(amplitudeGains[2] ** 2).toBeLessThan(0.06 * amplitudeGains[3] ** 2)
+    expect(decodeFrameFromPcm(framePcm)?.frame.raw).toEqual(transfer.frames[0])
+  }, 20_000)
+
+  it('recovers a frame through a short competing-tone burst', async () => {
+    const transfer = await buildTransfer(
+      'burst',
+      '',
+      Uint8Array.from({ length: 31 }, (_, index) => (index * 29 + 7) & 0xff),
+    )
+    const framePcm = modulateFrame(transfer.frames[0])
+    const bodySymbols = encodeFrameBodySymbols(transfer.frames[0])
+    const burstSymbol = 120
+
+    for (let damaged = 0; damaged < 2; damaged += 1) {
+      const symbolIndex = burstSymbol + damaged
+      const wrongTone = (bodySymbols[symbolIndex] + 1) % TONE_FREQUENCIES.length
+      const phaseStep = 2 * Math.PI * TONE_FREQUENCIES[wrongTone] / AUDIO_SAMPLE_RATE
+      const symbolStart = (PREAMBLE_SYMBOL_COUNT + symbolIndex) * SYMBOL_SAMPLES
+
+      for (let sample = 0; sample < SYMBOL_SAMPLES; sample += 1) {
+        framePcm[symbolStart + sample] = PEAK_AMPLITUDE * Math.sin(sample * phaseStep)
+      }
+    }
+
+    expect(decodeFrameFromPcm(framePcm)?.frame.raw).toEqual(transfer.frames[0])
+  }, 20_000)
+
+  it('falls back to raw body decisions after sync-only carrier interference', async () => {
+    const transfer = await buildTransfer(
+      'sync-interference',
+      '',
+      Uint8Array.from({ length: 63 }, (_, index) => (index * 43 + 17) & 0xff),
+    )
+    const framePcm = modulateFrame(transfer.frames[0])
+    const interferenceFrequency = TONE_FREQUENCIES[2]
+    const phaseStep = 2 * Math.PI * interferenceFrequency / AUDIO_SAMPLE_RATE
+    const interferenceEnd = PREAMBLE_SYMBOL_COUNT * SYMBOL_SAMPLES
+
+    // The interferer raises the sync-derived floor for carrier 2, then vanishes
+    // for the clean body so only the independent raw hard path can recover it.
+    for (let sample = 0; sample < interferenceEnd; sample += 1) {
+      framePcm[sample] += 0.16 * Math.sin(sample * phaseStep + 0.37)
+    }
+
+    expect(decodeFrameFromPcm(framePcm)?.frame.raw).toEqual(transfer.frames[0])
+  }, 20_000)
+
+  it('decodes under loud audible playback and output compression', async () => {
+    const transfer = await buildTransfer('music', '', new Uint8Array([8, 6, 7, 5, 3, 0, 9]))
+    const framePcm = modulateFrame(transfer.frames[0])
+    const leadingSamples = 311
+    const pcm = new Float32Array(leadingSamples + framePcm.length + 97)
+    const audibleFrequencies = [110, 440, 1_760, 7_040, 15_360]
+
+    for (let index = 0; index < pcm.length; index += 1) {
+      const movement = 0.72 + 0.28 * Math.sin(2 * Math.PI * 2.3 * index / AUDIO_SAMPLE_RATE)
+      let audible = 0
+      for (let tone = 0; tone < audibleFrequencies.length; tone += 1) {
+        audible += (0.13 / (tone + 1)) * Math.sin(
+          2 * Math.PI * audibleFrequencies[tone] * index / AUDIO_SAMPLE_RATE + tone * 0.91,
+        )
+      }
+      const signalIndex = index - leadingSamples
+      const ultrasonic = signalIndex >= 0 && signalIndex < framePcm.length
+        ? framePcm[signalIndex] * 0.16
+        : 0
+      const mixed = audible * movement + ultrasonic
+      pcm[index] = Math.tanh(mixed * 1.8) / Math.tanh(1.8)
+    }
+
+    expect(decodeFrameFromPcm(pcm)?.frame.raw).toEqual(transfer.frames[0])
+  }, 20_000)
+
+  it('decodes while rejecting an in-band harmonic from audible playback', async () => {
+    const transfer = await buildTransfer('harmonic', '', new Uint8Array([2, 7, 1, 8, 2, 8]))
+    const framePcm = modulateFrame(transfer.frames[0])
+    const leadingSamples = 173
+
+    for (const carrierFrequency of TONE_FREQUENCIES) {
+      const pcm = new Float32Array(leadingSamples + framePcm.length + 83)
+      const audibleFrequency = carrierFrequency / 2
+
+      for (let index = 0; index < pcm.length; index += 1) {
+        const audible = 0.36 * Math.sin(
+          2 * Math.PI * audibleFrequency * index / AUDIO_SAMPLE_RATE,
+        )
+        const playbackWithEvenOrderDistortion = audible + 0.3 * audible * audible
+        const signalIndex = index - leadingSamples
+        const ultrasonic = signalIndex >= 0 && signalIndex < framePcm.length
+          ? framePcm[signalIndex] * 0.15
+          : 0
+        pcm[index] = playbackWithEvenOrderDistortion + ultrasonic
+      }
+
+      expect(decodeFrameFromPcm(pcm)?.frame.raw).toEqual(transfer.frames[0])
+    }
   }, 20_000)
 
   it('reassembles consecutive PCM frames using the decoder’s consumed range', async () => {

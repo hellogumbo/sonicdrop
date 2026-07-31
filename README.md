@@ -49,7 +49,9 @@ The Vite config allowlists that exact hostname. If you switch to another ngrok d
 - Files up to 4 KB, with a 1 KB or smaller target
 - Fixed 48 kHz Web Audio paths
 - Four continuous-phase FSK carriers at 20.80, 21.12, 21.44, and 21.76 kHz
-- Hamming single-bit correction on each byte
+- Version 3 bit interleaving that spreads short bursts across Hamming codewords
+- Preamble-calibrated soft Hamming decisions with an independent raw-decision fallback
+- An offset-aware carrier monitor that measures the ultrasonic lanes instead of full-band microphone volume
 - CRC-32 validation on every frame
 - SHA-256 verification before a message is shown or a file can be saved
 - No audible fallback frequency
