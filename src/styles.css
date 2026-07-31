@@ -995,7 +995,7 @@ button {
 }
 
 .site-footer__credit,
-.site-footer__meta {
+.site-footer__meta > span {
   white-space: nowrap;
 }
 
@@ -1013,7 +1013,37 @@ button {
 }
 
 .site-footer__meta {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
   justify-self: end;
+}
+
+.site-footer__meta > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.site-footer__github {
+  display: inline-flex;
+  width: 44px;
+  height: 44px;
+  flex: 0 0 44px;
+  align-items: center;
+  justify-content: center;
+  color: var(--ink);
+  transition: color 160ms ease, transform 160ms ease;
+}
+
+.site-footer__github:hover {
+  color: var(--carrier);
+  transform: translateY(-1px);
+}
+
+.site-footer__github svg {
+  width: 19px;
+  height: 19px;
 }
 
 .sr-only {
@@ -1248,7 +1278,6 @@ button {
 
   .site-footer__meta {
     overflow: hidden;
-    text-overflow: ellipsis;
   }
 }
 
