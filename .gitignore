@@ -1,0 +1,35 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Build and tooling output
+dist/
+coverage/
+.vite/
+*.tsbuildinfo
+
+# Tests and browser automation
+.playwright-cli/
+output/playwright/
+playwright-report/
+test-results/
+
+# Vercel project linkage and local environment
+.vercel/
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Editors and operating systems
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
