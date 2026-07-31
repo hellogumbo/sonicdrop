@@ -38,20 +38,30 @@ export const FRAME_DURATION_SECONDS = FRAME_SAMPLES / AUDIO_SAMPLE_RATE
 
 const MAGIC_S = 0x53
 const MAGIC_D = 0x44
-const PROTOCOL_VERSION = 2
+const PROTOCOL_VERSION = 3
 const CRC_OFFSET = 76
 const HAMMING_BITS = 12
 const FADE_SAMPLES = Math.round(AUDIO_SAMPLE_RATE * 0.01)
 const ANALYSIS_GUARD_SAMPLES = 100
 const ANALYSIS_SAMPLES = SYMBOL_SAMPLES - ANALYSIS_GUARD_SAMPLES * 2
 const GRAY_DIBIT_TONE_MAP = [0, 1, 3, 2] as const
-const ANALYSIS_WINDOW = Float64Array.from(
-  { length: ANALYSIS_SAMPLES },
-  (_, index) => 0.5 - 0.5 * Math.cos(2 * Math.PI * index / (ANALYSIS_SAMPLES - 1)),
-)
+const LEVEL_FREQUENCY_OFFSETS = [-100, -50, 0, 50, 100] as const
+const ANALYSIS_WINDOW = createHannWindow(ANALYSIS_SAMPLES)
 const GOERTZEL_COEFFICIENTS = new Map<number, number>()
+let cachedLevelWindow: { samples: Float64Array; sum: number } | undefined
+const HAMMING_CODEWORDS = Uint16Array.from(
+  { length: 256 },
+  (_, byte) => hammingEncodeByte(byte),
+)
 const UTF8_ENCODER = new TextEncoder()
 const UTF8_DECODER = new TextDecoder('utf-8', { fatal: true })
+
+type ToneEnergies = [number, number, number, number]
+
+interface ToneChannelCalibration {
+  noiseFloors: ToneEnergies
+  signalGains: ToneEnergies
+}
 
 export type ProtocolErrorCode =
   | 'INVALID_ARGUMENT'
@@ -546,6 +556,36 @@ export async function assembleTransfer(
   }
 }
 
+/** Estimate root-sum carrier amplitude while rejecting ordinary audible audio. */
+export function measureUltrasonicLevel(pcm: Float32Array): number {
+  if (pcm.length < 2) return 0
+
+  if (!cachedLevelWindow || cachedLevelWindow.samples.length !== pcm.length) {
+    const samples = createHannWindow(pcm.length)
+    cachedLevelWindow = {
+      samples,
+      sum: samples.reduce((total, sample) => total + sample, 0),
+    }
+  }
+
+  if (cachedLevelWindow.sum <= Number.EPSILON) return 0
+
+  let carrierPower = 0
+  for (const frequency of TONE_FREQUENCIES) {
+    let power = 0
+    for (const offset of LEVEL_FREQUENCY_OFFSETS) {
+      power = Math.max(
+        power,
+        goertzelPowerWithWindow(pcm, 0, frequency + offset, cachedLevelWindow.samples),
+      )
+    }
+    const amplitude = 2 * Math.sqrt(power) / cachedLevelWindow.sum
+    carrierPower += amplitude * amplitude
+  }
+
+  return Math.sqrt(carrierPower)
+}
+
 /** App-facing PCM decoder with only the frame and consumed sample range. */
 export function decodeFrameFromPcm(pcm: Float32Array): DecodedPcmFrame | null {
   const decoded = findAndDemodulateFrame(pcm)
@@ -559,17 +599,27 @@ export function decodeFrameFromPcm(pcm: Float32Array): DecodedPcmFrame | null {
   }
 }
 
-/** Convert a validated frame into its 480 Gray-mapped 4-CPFSK body symbols. */
+/**
+ * Convert a validated frame into its 480 Gray-mapped 4-CPFSK body symbols.
+ *
+ * Hamming words are transposed bit-first across the complete frame, and each
+ * 4-FSK symbol carries one bit from each of two different codewords. A short
+ * acoustic burst therefore spreads errors across independently correctable
+ * bytes instead of concentrating them in one codeword.
+ */
 export function encodeFrameBodySymbols(rawFrame: Uint8Array): Uint8Array {
   parseRawFrame(rawFrame)
   const symbols = new Uint8Array(BODY_SYMBOL_COUNT)
-  let symbolOffset = 0
+  const codewords = Uint16Array.from(rawFrame, (byte) => HAMMING_CODEWORDS[byte])
+  const bytePairs = FRAME_BYTES / 2
 
-  for (const byte of rawFrame) {
-    const word = hammingEncodeByte(byte)
-    for (let shift = 10; shift >= 0; shift -= 2) {
-      symbols[symbolOffset] = GRAY_DIBIT_TONE_MAP[(word >>> shift) & 0b11]
-      symbolOffset += 1
+  for (let bitIndex = 0; bitIndex < HAMMING_BITS; bitIndex += 1) {
+    const shift = HAMMING_BITS - 1 - bitIndex
+    for (let pairIndex = 0; pairIndex < bytePairs; pairIndex += 1) {
+      const firstBit = (codewords[pairIndex * 2] >>> shift) & 1
+      const secondBit = (codewords[pairIndex * 2 + 1] >>> shift) & 1
+      symbols[bitIndex * bytePairs + pairIndex] =
+        GRAY_DIBIT_TONE_MAP[(firstBit << 1) | secondBit]
     }
   }
 
@@ -581,6 +631,20 @@ export function decodeFrameBodySymbols(symbols: Uint8Array): {
   rawFrame: Uint8Array
   correctedCodewords: number
 } {
+  const codewords = deinterleaveBodyCodewords(symbols)
+  const rawFrame = new Uint8Array(FRAME_BYTES)
+  let correctedCodewords = 0
+
+  for (let byteIndex = 0; byteIndex < FRAME_BYTES; byteIndex += 1) {
+    const decoded = hammingDecodeWord(codewords[byteIndex])
+    rawFrame[byteIndex] = decoded.byte
+    correctedCodewords += decoded.corrected ? 1 : 0
+  }
+
+  return { rawFrame, correctedCodewords }
+}
+
+function deinterleaveBodyCodewords(symbols: Uint8Array): Uint16Array {
   if (symbols.length !== BODY_SYMBOL_COUNT) {
     throw new ProtocolError(
       'INVALID_FRAME',
@@ -588,26 +652,23 @@ export function decodeFrameBodySymbols(symbols: Uint8Array): {
     )
   }
 
-  const rawFrame = new Uint8Array(FRAME_BYTES)
-  let symbolOffset = 0
-  let correctedCodewords = 0
+  const codewords = new Uint16Array(FRAME_BYTES)
+  const bytePairs = FRAME_BYTES / 2
 
-  for (let byteIndex = 0; byteIndex < FRAME_BYTES; byteIndex += 1) {
-    let word = 0
-    for (let dibitIndex = 0; dibitIndex < 6; dibitIndex += 1) {
-      const tone = symbols[symbolOffset]
+  for (let bitIndex = 0; bitIndex < HAMMING_BITS; bitIndex += 1) {
+    for (let pairIndex = 0; pairIndex < bytePairs; pairIndex += 1) {
+      const transmittedIndex = bitIndex * bytePairs + pairIndex
+      const tone = symbols[transmittedIndex]
       if (tone > 3) {
         throw new ProtocolError('INVALID_FRAME', `Invalid tone index ${tone}.`)
       }
-      word = (word << 2) | GRAY_DIBIT_TONE_MAP[tone]
-      symbolOffset += 1
+      const dibit = GRAY_DIBIT_TONE_MAP[tone]
+      codewords[pairIndex * 2] = (codewords[pairIndex * 2] << 1) | (dibit >>> 1)
+      codewords[pairIndex * 2 + 1] = (codewords[pairIndex * 2 + 1] << 1) | (dibit & 1)
     }
-    const decoded = hammingDecodeWord(word)
-    rawFrame[byteIndex] = decoded.byte
-    correctedCodewords += decoded.corrected ? 1 : 0
   }
 
-  return { rawFrame, correctedCodewords }
+  return codewords
 }
 
 /** Render one CRC-valid raw frame as strict 48 kHz ultrasonic PCM. */
@@ -645,7 +706,10 @@ export function findAndDemodulateFrame(pcm: Float32Array): DemodulatedFrame | nu
   for (const estimatedStart of candidateStarts) {
     const energies = measureToneEnergies(pcm, estimatedStart + ANALYSIS_GUARD_SAMPLES, 0)
     const totalEnergy = sumEnergies(energies)
-    if (totalEnergy <= 1e-12 || energies[0] / totalEnergy < 0.68) {
+    if (totalEnergy <= 1e-12 || energies[0] / totalEnergy < 0.18) {
+      continue
+    }
+    if (preambleScore(pcm, estimatedStart, 0, 8) < 0.5) {
       continue
     }
     if (preambleScore(pcm, estimatedStart, 0) < 0.62) {
@@ -665,31 +729,51 @@ export function findAndDemodulateFrame(pcm: Float32Array): DemodulatedFrame | nu
       continue
     }
 
+    const calibration = estimateToneChannel(
+      pcm,
+      alignedStart,
+      frequencyEstimate.offsetHz,
+    )
     const bodyStart = alignedStart + PREAMBLE_SYMBOL_COUNT * SYMBOL_SAMPLES
-    const symbols = new Uint8Array(BODY_SYMBOL_COUNT)
+    const rawSymbols = new Uint8Array(BODY_SYMBOL_COUNT)
+    const toneScores: ToneEnergies[] = []
     let confidenceTotal = 0
 
     for (let symbolIndex = 0; symbolIndex < BODY_SYMBOL_COUNT; symbolIndex += 1) {
       const start = bodyStart + symbolIndex * SYMBOL_SAMPLES + ANALYSIS_GUARD_SAMPLES
       const bodyEnergies = measureToneEnergies(pcm, start, frequencyEstimate.offsetHz)
-      const decision = strongestTone(bodyEnergies)
-      symbols[symbolIndex] = decision.tone
+      rawSymbols[symbolIndex] = strongestTone(bodyEnergies).tone
+      const scores = normalizeToneEnergies(bodyEnergies, calibration)
+      const decision = strongestTone(scores)
+      toneScores.push(scores)
       confidenceTotal += decision.confidence
     }
 
+    const finalizeDecoded = (
+      decoded: { rawFrame: Uint8Array; correctedCodewords: number },
+    ): DemodulatedFrame => ({
+      rawFrame: decoded.rawFrame,
+      frame: parseRawFrame(decoded.rawFrame),
+      startSample: alignedStart,
+      endSample: alignedStart + FRAME_SAMPLES,
+      signalEndSample: alignedStart + FRAME_SIGNAL_SAMPLES,
+      correctedCodewords: decoded.correctedCodewords,
+      frequencyOffsetHz: frequencyEstimate.offsetHz,
+      confidence: confidenceTotal / BODY_SYMBOL_COUNT,
+    })
+
     try {
-      const decoded = decodeFrameBodySymbols(symbols)
-      const frame = parseRawFrame(decoded.rawFrame)
-      return {
-        rawFrame: decoded.rawFrame,
-        frame,
-        startSample: alignedStart,
-        endSample: alignedStart + FRAME_SAMPLES,
-        signalEndSample: alignedStart + FRAME_SIGNAL_SAMPLES,
-        correctedCodewords: decoded.correctedCodewords,
-        frequencyOffsetHz: frequencyEstimate.offsetHz,
-        confidence: confidenceTotal / BODY_SYMBOL_COUNT,
+      return finalizeDecoded(decodeFrameBodyToneScores(toneScores, rawSymbols))
+    } catch (error) {
+      if (!(error instanceof ProtocolError)) {
+        throw error
       }
+    }
+
+    // Sync-derived calibration can become stale when an interferer disappears
+    // before the body. Raw decisions provide an independent CRC-checked path.
+    try {
+      return finalizeDecoded(decodeFrameBodySymbols(rawSymbols))
     } catch (error) {
       if (!(error instanceof ProtocolError)) {
         throw error
@@ -858,22 +942,147 @@ function renderSymbols(
   return pcm
 }
 
+function decodeFrameBodyToneScores(
+  toneScores: readonly ToneEnergies[],
+  hardSymbols: Uint8Array,
+): { rawFrame: Uint8Array; correctedCodewords: number } {
+  if (toneScores.length !== BODY_SYMBOL_COUNT || hardSymbols.length !== BODY_SYMBOL_COUNT) {
+    throw new ProtocolError(
+      'INVALID_FRAME',
+      `A frame body must contain ${BODY_SYMBOL_COUNT} tone likelihoods.`,
+    )
+  }
+
+  const rawFrame = new Uint8Array(FRAME_BYTES)
+  const bytePairs = FRAME_BYTES / 2
+  const hardCodewords = deinterleaveBodyCodewords(hardSymbols)
+  let correctedCodewords = 0
+
+  for (let byteIndex = 0; byteIndex < FRAME_BYTES; byteIndex += 1) {
+    const zeroScores = new Float64Array(HAMMING_BITS)
+    const oneScores = new Float64Array(HAMMING_BITS)
+
+    for (let bitIndex = 0; bitIndex < HAMMING_BITS; bitIndex += 1) {
+      const transmittedIndex = bitIndex * bytePairs + Math.floor(byteIndex / 2)
+      const scores = toneScores[transmittedIndex]
+
+      if (byteIndex % 2 === 0) {
+        zeroScores[bitIndex] = Math.max(scores[0], scores[1])
+        oneScores[bitIndex] = Math.max(scores[2], scores[3])
+      } else {
+        zeroScores[bitIndex] = Math.max(scores[0], scores[3])
+        oneScores[bitIndex] = Math.max(scores[1], scores[2])
+      }
+    }
+
+    let bestByte = 0
+    let bestScore = Number.NEGATIVE_INFINITY
+    for (let candidateByte = 0; candidateByte <= 0xff; candidateByte += 1) {
+      const candidateWord = HAMMING_CODEWORDS[candidateByte]
+      let candidateScore = 0
+      for (let bitIndex = 0; bitIndex < HAMMING_BITS; bitIndex += 1) {
+        const bit = (candidateWord >>> (HAMMING_BITS - 1 - bitIndex)) & 1
+        candidateScore += bit === 0 ? zeroScores[bitIndex] : oneScores[bitIndex]
+      }
+      if (candidateScore > bestScore) {
+        bestByte = candidateByte
+        bestScore = candidateScore
+      }
+    }
+
+    rawFrame[byteIndex] = bestByte
+    correctedCodewords += HAMMING_CODEWORDS[bestByte] === hardCodewords[byteIndex] ? 0 : 1
+  }
+
+  return { rawFrame, correctedCodewords }
+}
+
+function estimateToneChannel(
+  pcm: Float32Array,
+  startSample: number,
+  frequencyOffsetHz: number,
+): ToneChannelCalibration {
+  const activeSamples = Array.from({ length: TONE_FREQUENCIES.length }, () => [] as number[])
+  const inactiveSamples = Array.from({ length: TONE_FREQUENCIES.length }, () => [] as number[])
+
+  for (let index = 0; index < SYNC_SYMBOLS.length; index += 1) {
+    const symbolStart =
+      startSample
+      + (LEADER_SYMBOL_COUNT + index) * SYMBOL_SAMPLES
+      + ANALYSIS_GUARD_SAMPLES
+    const energies = measureToneEnergies(pcm, symbolStart, frequencyOffsetHz)
+    const expectedTone = SYNC_SYMBOLS[index]
+
+    for (let tone = 0; tone < TONE_FREQUENCIES.length; tone += 1) {
+      const samples = tone === expectedTone ? activeSamples[tone] : inactiveSamples[tone]
+      samples.push(energies[tone])
+    }
+  }
+
+  const noiseFloors = inactiveSamples.map(median) as ToneEnergies
+  const rawGains = activeSamples.map((samples, tone) => (
+    median(samples) - noiseFloors[tone]
+  )) as ToneEnergies
+  const strongestGain = Math.max(...rawGains, 1e-12)
+  const minimumGain = strongestGain * 0.06
+  const signalGains = rawGains.map((gain) => Math.max(gain, minimumGain)) as ToneEnergies
+
+  return { noiseFloors, signalGains }
+}
+
+function normalizeToneEnergies(
+  energies: ToneEnergies,
+  calibration: ToneChannelCalibration,
+): ToneEnergies {
+  return energies.map((energy, tone) => {
+    const normalized =
+      (energy - calibration.noiseFloors[tone])
+      / calibration.signalGains[tone]
+    return Math.max(-1, Math.min(4, normalized))
+  }) as ToneEnergies
+}
+
+function median(values: readonly number[]): number {
+  if (values.length === 0) return 0
+  const ordered = [...values].sort((left, right) => left - right)
+  const middle = Math.floor(ordered.length / 2)
+  return ordered.length % 2 === 0
+    ? (ordered[middle - 1] + ordered[middle]) / 2
+    : ordered[middle]
+}
+
 function measureToneEnergies(
   pcm: Float32Array,
   startSample: number,
   frequencyOffsetHz: number,
-): [number, number, number, number] {
+): ToneEnergies {
   return TONE_FREQUENCIES.map((frequency) => goertzelPower(
     pcm,
     startSample,
     frequency + frequencyOffsetHz,
-  )) as [number, number, number, number]
+  )) as ToneEnergies
+}
+
+function createHannWindow(length: number): Float64Array {
+  return Float64Array.from(
+    { length },
+    (_, index) => 0.5 - 0.5 * Math.cos(2 * Math.PI * index / (length - 1)),
+  )
 }
 
 function goertzelPower(
   pcm: Float32Array,
   startSample: number,
   frequency: number,
+): number {
+  return goertzelPowerWithWindow(pcm, startSample, frequency, ANALYSIS_WINDOW)
+}
+
+function goertzelPowerWithWindow(
+  pcm: Float32Array,
+  startSample: number,
+  frequency: number,
+  window: Float64Array,
 ): number {
   let coefficient = GOERTZEL_COEFFICIENTS.get(frequency)
   if (coefficient === undefined) {
@@ -883,9 +1092,9 @@ function goertzelPower(
   let previous = 0
   let previousPrevious = 0
 
-  for (let index = 0; index < ANALYSIS_SAMPLES; index += 1) {
+  for (let index = 0; index < window.length; index += 1) {
     const current =
-      pcm[startSample + index] * ANALYSIS_WINDOW[index]
+      pcm[startSample + index] * window[index]
       + coefficient * previous
       - previousPrevious
     previousPrevious = previous
@@ -904,23 +1113,46 @@ function sumEnergies(energies: readonly number[]): number {
   return energies[0] + energies[1] + energies[2] + energies[3]
 }
 
-function preambleScore(pcm: Float32Array, startSample: number, frequencyOffsetHz: number): number {
-  let score = 0
+function preambleScore(
+  pcm: Float32Array,
+  startSample: number,
+  frequencyOffsetHz: number,
+  symbolCount: number = SYNC_SYMBOLS.length,
+): number {
+  const activeEnergy = [0, 0, 0, 0]
+  const inactiveEnergy = [0, 0, 0, 0]
+  const activeCounts = [0, 0, 0, 0]
+  const inactiveCounts = [0, 0, 0, 0]
 
-  for (let index = 0; index < SYNC_SYMBOLS.length; index += 1) {
+  for (let index = 0; index < symbolCount; index += 1) {
     const symbolStart =
       startSample
       + (LEADER_SYMBOL_COUNT + index) * SYMBOL_SAMPLES
       + ANALYSIS_GUARD_SAMPLES
     const energies = measureToneEnergies(pcm, symbolStart, frequencyOffsetHz)
-    const total = sumEnergies(energies)
-    if (total <= 1e-12) {
-      return 0
+    const expectedTone = SYNC_SYMBOLS[index]
+
+    for (let tone = 0; tone < TONE_FREQUENCIES.length; tone += 1) {
+      if (tone === expectedTone) {
+        activeEnergy[tone] += energies[tone]
+        activeCounts[tone] += 1
+      } else {
+        inactiveEnergy[tone] += energies[tone]
+        inactiveCounts[tone] += 1
+      }
     }
-    score += energies[SYNC_SYMBOLS[index]] / total
   }
 
-  return score / SYNC_SYMBOLS.length
+  let score = 0
+  for (let tone = 0; tone < TONE_FREQUENCIES.length; tone += 1) {
+    const active = activeEnergy[tone] / Math.max(1, activeCounts[tone])
+    const inactive = inactiveEnergy[tone] / Math.max(1, inactiveCounts[tone])
+    if (active > 1e-12) {
+      score += Math.max(0, active - inactive) / active
+    }
+  }
+
+  return score / TONE_FREQUENCIES.length
 }
 
 function findBestSyncStart(
@@ -1055,7 +1287,7 @@ function estimateFrequencyOffset(
   return { offsetHz: bestOffset, score: bestScore }
 }
 
-function strongestTone(energies: [number, number, number, number]): {
+function strongestTone(energies: ToneEnergies): {
   tone: number
   confidence: number
 } {
